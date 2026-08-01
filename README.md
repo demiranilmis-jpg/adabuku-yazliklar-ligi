@@ -1,38 +1,20 @@
-# Adabükü Yazlıklar Ligi
+# Adabükü Yazlıklar Ligi v2
 
-Node.js + Express + PostgreSQL ile hazırlanmış, mobil uyumlu lig yönetim sitesi.
+## Render ayarları
+- Language: Node
+- Build Command: `npm install`
+- Start Command: `npm start`
+- Root Directory: boş
 
-## Özellikler
-- Halka açık ana sayfa
-- Fikstür ve maç sonuçları
-- Otomatik puan durumu
-- Gol, asist ve kurtarış krallığı
-- Takımlar ve oyuncular
-- Şifreli yönetici paneli
-- Lig adı, sezon, renk ve logo yönetimi
+## Environment Variables
+- `DATABASE_URL`: Neon connection string
+- `SESSION_SECRET`: uzun ve rastgele metin
+- `ADMIN_USERNAME`: admin
+- `ADMIN_PASSWORD`: güçlü bir şifre
+- `NODE_ENV`: production
+- `NODE_VERSION`: 20
 
-## Yerelde çalıştırma
-1. Node.js 20+ ve PostgreSQL kurun.
-2. `.env.example` dosyasını `.env` adıyla kopyalayın.
-3. `DATABASE_URL`, `SESSION_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASSWORD` değerlerini girin.
-4. Terminalde:
-   npm install
-   npm start
-5. Tarayıcıdan `http://localhost:3000` adresine gidin.
+Veritabanı tabloları ilk açılışta otomatik oluşturulur.
 
-## Halka açık yayınlama: Render + Neon
-1. Neon'da ücretsiz PostgreSQL veritabanı oluşturun ve bağlantı adresini alın.
-2. Projeyi GitHub deposuna yükleyin.
-3. Render'da New > Web Service seçip GitHub deposunu bağlayın.
-4. Build Command: `npm install`
-5. Start Command: `npm start`
-6. Environment Variables:
-   - DATABASE_URL = Neon bağlantı adresi
-   - SESSION_SECRET = uzun rastgele bir metin
-   - ADMIN_USERNAME = admin
-   - ADMIN_PASSWORD = güçlü ve yeni bir şifre
-   - NODE_ENV = production
-7. Deploy düğmesine basın. Render size halka açık bir adres verir.
-
-## Güvenlik
-İlk kurulumda verilen `ulel1209` şifresini yayına almadan önce mutlaka değiştirin. Şifre `.env` içinde tutulur; GitHub'a `.env` dosyasını yüklemeyin.
+## Yönetici paneli
+`/admin`
