@@ -1,20 +1,14 @@
-# Adabükü Yazlıklar Ligi v2
+# Adabükü Yazlıklar Ligi
+Klasör gerektirmeyen tek dosyalı Express sürümü.
 
-## Render ayarları
-- Language: Node
-- Build Command: `npm install`
-- Start Command: `npm start`
+Render:
+- Build Command: npm install
+- Start Command: npm start
 - Root Directory: boş
 
-## Environment Variables
-- `DATABASE_URL`: Neon connection string
-- `SESSION_SECRET`: uzun ve rastgele metin
-- `ADMIN_USERNAME`: admin
-- `ADMIN_PASSWORD`: güçlü bir şifre
-- `NODE_ENV`: production
-- `NODE_VERSION`: 20
-
-Veritabanı tabloları ilk açılışta otomatik oluşturulur.
-
-## Yönetici paneli
-`/admin`
+Environment:
+- DATABASE_URL
+- SESSION_SECRET
+- ADMIN_USERNAME
+- ADMIN_PASSWORD
+- NODE_ENV=production

@@ -1,201 +1,78 @@
 require('dotenv').config();
-const path = require('path');
 const express = require('express');
 const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
 const helmet = require('helmet');
-const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const isProd = process.env.NODE_ENV === 'production';
-
-if (!process.env.DATABASE_URL) {
-  console.error('DATABASE_URL ortam degiskeni eksik.');
+if (!process.env.DATABASE_URL || !process.env.SESSION_SECRET) {
+  console.error('DATABASE_URL veya SESSION_SECRET eksik.');
   process.exit(1);
 }
-if (!process.env.SESSION_SECRET) {
-  console.error('SESSION_SECRET ortam degiskeni eksik.');
-  process.exit(1);
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: isProd ? { rejectUnauthorized: false } : false });
+const q = (text, params=[]) => pool.query(text, params);
+const n = (v,d=0) => Number.isFinite(Number(v)) ? Number(v) : d;
+const e = (s='') => String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const adminOnly=(req,res,next)=>req.session.admin?next():res.redirect('/admin/login');
+app.set('trust proxy',1);
+app.use(helmet({contentSecurityPolicy:false}));
+app.use(express.urlencoded({extended:true,limit:'1mb'}));
+app.use(session({store:new pgSession({pool,tableName:'user_sessions',createTableIfMissing:true}),secret:process.env.SESSION_SECRET,resave:false,saveUninitialized:false,cookie:{httpOnly:true,secure:isProd,sameSite:'lax',maxAge:28800000}}));
+
+async function initDb(){
+await q(`CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY DEFAULT 1 CHECK(id=1),league_name TEXT NOT NULL DEFAULT 'Adabükü Yazlıklar Ligi',season TEXT NOT NULL DEFAULT '2026 Yaz Sezonu',primary_color TEXT NOT NULL DEFAULT '#075985',secondary_color TEXT NOT NULL DEFAULT '#f59e0b',logo_url TEXT DEFAULT '',announcement TEXT DEFAULT 'Adabükü Yazlıklar Ligi resmi internet sitesine hoş geldiniz.')`);
+await q(`INSERT INTO settings(id) VALUES(1) ON CONFLICT(id) DO NOTHING`);
+await q(`CREATE TABLE IF NOT EXISTS teams(id SERIAL PRIMARY KEY,name TEXT NOT NULL UNIQUE,short_name TEXT DEFAULT '',logo_url TEXT DEFAULT '',color TEXT DEFAULT '#075985')`);
+await q(`CREATE TABLE IF NOT EXISTS players(id SERIAL PRIMARY KEY,team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE,name TEXT NOT NULL,jersey_no INTEGER,position TEXT DEFAULT 'Oyuncu',photo_url TEXT DEFAULT '')`);
+await q(`CREATE TABLE IF NOT EXISTS matches(id SERIAL PRIMARY KEY,week INTEGER NOT NULL DEFAULT 1,match_date TIMESTAMPTZ,venue TEXT DEFAULT '',home_team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,away_team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,home_score INTEGER,away_score INTEGER,status TEXT NOT NULL DEFAULT 'scheduled',notes TEXT DEFAULT '',CHECK(home_team_id<>away_team_id))`);
+await q(`CREATE TABLE IF NOT EXISTS player_stats(id SERIAL PRIMARY KEY,match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,goals INTEGER NOT NULL DEFAULT 0,assists INTEGER NOT NULL DEFAULT 0,saves INTEGER NOT NULL DEFAULT 0,yellow_cards INTEGER NOT NULL DEFAULT 0,red_cards INTEGER NOT NULL DEFAULT 0,UNIQUE(match_id,player_id))`);
 }
+async function settings(){return (await q('SELECT * FROM settings WHERE id=1')).rows[0];}
+async function standings(){const {rows}=await q(`SELECT t.id,t.name,t.short_name,t.logo_url,
+COUNT(m.id) FILTER(WHERE m.status='played')::int played,
+COUNT(m.id) FILTER(WHERE m.status='played' AND ((m.home_team_id=t.id AND m.home_score>m.away_score) OR (m.away_team_id=t.id AND m.away_score>m.home_score)))::int won,
+COUNT(m.id) FILTER(WHERE m.status='played' AND m.home_score=m.away_score)::int drawn,
+COUNT(m.id) FILTER(WHERE m.status='played' AND ((m.home_team_id=t.id AND m.home_score<m.away_score) OR (m.away_team_id=t.id AND m.away_score<m.home_score)))::int lost,
+COALESCE(SUM(CASE WHEN m.status='played' AND m.home_team_id=t.id THEN m.home_score WHEN m.status='played' AND m.away_team_id=t.id THEN m.away_score ELSE 0 END),0)::int gf,
+COALESCE(SUM(CASE WHEN m.status='played' AND m.home_team_id=t.id THEN m.away_score WHEN m.status='played' AND m.away_team_id=t.id THEN m.home_score ELSE 0 END),0)::int ga,
+(COUNT(m.id) FILTER(WHERE m.status='played' AND ((m.home_team_id=t.id AND m.home_score>m.away_score) OR (m.away_team_id=t.id AND m.away_score>m.home_score)))*3+COUNT(m.id) FILTER(WHERE m.status='played' AND m.home_score=m.away_score))::int points
+FROM teams t LEFT JOIN matches m ON(m.home_team_id=t.id OR m.away_team_id=t.id) GROUP BY t.id ORDER BY points DESC,(COALESCE(SUM(CASE WHEN m.status='played' AND m.home_team_id=t.id THEN m.home_score WHEN m.status='played' AND m.away_team_id=t.id THEN m.away_score ELSE 0 END),0)-COALESCE(SUM(CASE WHEN m.status='played' AND m.home_team_id=t.id THEN m.away_score WHEN m.status='played' AND m.away_team_id=t.id THEN m.home_score ELSE 0 END),0)) DESC,gf DESC,t.name`);return rows.map(r=>({...r,gd:r.gf-r.ga}));}
+async function leaders(col,limit=20){if(!['goals','assists','saves','yellow_cards','red_cards'].includes(col))throw Error('Geçersiz istatistik');return (await q(`SELECT p.name,t.name team_name,COALESCE(SUM(ps.${col}),0)::int value FROM players p JOIN teams t ON t.id=p.team_id LEFT JOIN player_stats ps ON ps.player_id=p.id GROUP BY p.id,t.id HAVING COALESCE(SUM(ps.${col}),0)>0 ORDER BY value DESC,p.name LIMIT $1`,[limit])).rows;}
+function layout(s,title,body,admin=false){return `<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(title)} | ${e(s.league_name)}</title><style>
+:root{--p:${e(s.primary_color)};--s:${e(s.secondary_color)}}*{box-sizing:border-box}body{margin:0;font-family:Arial,sans-serif;background:#f3f6f8;color:#17202a}header{background:linear-gradient(135deg,var(--p),#063247);color:white;padding:22px 5%}header h1{margin:0;font-size:28px}nav{margin-top:14px;display:flex;gap:10px;flex-wrap:wrap}nav a{color:white;text-decoration:none;padding:8px 11px;border-radius:9px;background:#ffffff1a}.wrap{width:min(1180px,92%);margin:24px auto}.hero,.card{background:white;border-radius:16px;padding:20px;box-shadow:0 8px 25px #00000010;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px}table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;border-bottom:1px solid #e5e7eb;text-align:left}th{background:#f8fafc}.score{font-size:20px;font-weight:bold;color:var(--p)}input,select,textarea{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:9px;margin:5px 0 10px}button,.btn{background:var(--p);color:white;border:0;border-radius:9px;padding:10px 14px;cursor:pointer;text-decoration:none;display:inline-block}.danger{background:#b91c1c}.muted{color:#64748b}.adminnav{background:#111827;padding:10px;border-radius:12px;margin-bottom:16px}.adminnav a{color:white;margin-right:12px;text-decoration:none}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.flash{padding:12px;background:#ecfdf5;border:1px solid #86efac;border-radius:10px;margin-bottom:12px}@media(max-width:650px){header h1{font-size:22px}th,td{font-size:13px;padding:8px 4px}}
+</style></head><body><header><h1>${e(s.league_name)}</h1><div>${e(s.season)}</div><nav><a href="/">Ana Sayfa</a><a href="/puan-durumu">Puan Durumu</a><a href="/fikstur">Fikstür</a><a href="/istatistikler">İstatistikler</a><a href="/takimlar">Takımlar</a><a href="/admin">Yönetici</a></nav></header><main class="wrap">${admin?adminNav():''}${body}</main></body></html>`}
+function adminNav(){return `<div class="adminnav"><a href="/admin">Panel</a><a href="/admin/settings">Lig Ayarları</a><a href="/admin/teams">Takımlar</a><a href="/admin/players">Oyuncular</a><a href="/admin/matches">Maçlar</a><a href="/admin/stats">İstatistik Girişi</a><form method="post" action="/admin/logout" style="display:inline"><button style="background:#374151;padding:6px 10px">Çıkış</button></form></div>`}
+const tableHtml=(rows)=>`<div class="card"><h2>Puan Durumu</h2><table><tr><th>#</th><th>Takım</th><th>O</th><th>G</th><th>B</th><th>M</th><th>AG</th><th>YG</th><th>AV</th><th>P</th></tr>${rows.map((r,i)=>`<tr><td>${i+1}</td><td><b>${e(r.name)}</b></td><td>${r.played}</td><td>${r.won}</td><td>${r.drawn}</td><td>${r.lost}</td><td>${r.gf}</td><td>${r.ga}</td><td>${r.gd}</td><td><b>${r.points}</b></td></tr>`).join('')}</table></div>`;
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: isProd ? { rejectUnauthorized: false } : false
-});
+app.get('/',async(req,res,next)=>{try{const s=await settings(),st=await standings(),up=(await q(`SELECT m.*,h.name home_name,a.name away_name FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id WHERE m.status<>'played' ORDER BY m.match_date NULLS LAST LIMIT 6`)).rows,re=(await q(`SELECT m.*,h.name home_name,a.name away_name FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id WHERE m.status='played' ORDER BY m.match_date DESC NULLS LAST LIMIT 6`)).rows,g=await leaders('goals',5);res.send(layout(s,'Ana Sayfa',`<div class="hero"><h2>${e(s.announcement)}</h2><p>Fikstür, puan durumu ve oyuncu istatistikleri burada.</p></div>${tableHtml(st)}<div class="grid"><div class="card"><h2>Yaklaşan Maçlar</h2>${up.length?up.map(m=>`<p>${e(m.home_name)} <b>-</b> ${e(m.away_name)}<br><span class="muted">${m.match_date?new Date(m.match_date).toLocaleString('tr-TR'):'Tarih belirlenmedi'}</span></p>`).join(''):'Henüz maç yok.'}</div><div class="card"><h2>Sonuçlar</h2>${re.length?re.map(m=>`<p>${e(m.home_name)} <span class="score">${m.home_score}-${m.away_score}</span> ${e(m.away_name)}</p>`).join(''):'Henüz sonuç yok.'}</div><div class="card"><h2>Gol Krallığı</h2>${g.length?g.map((x,i)=>`<p>${i+1}. ${e(x.name)} <span class="muted">${e(x.team_name)}</span> — <b>${x.value}</b></p>`).join(''):'Henüz veri yok.'}</div></div>`));}catch(err){next(err)}});
+app.get('/puan-durumu',async(req,res,next)=>{try{const s=await settings();res.send(layout(s,'Puan Durumu',tableHtml(await standings())))}catch(e){next(e)}});
+app.get('/fikstur',async(req,res,next)=>{try{const s=await settings(),ms=(await q(`SELECT m.*,h.name home_name,a.name away_name FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id ORDER BY m.week,m.match_date NULLS LAST,m.id`)).rows;res.send(layout(s,'Fikstür',`<div class="card"><h2>Fikstür ve Sonuçlar</h2>${ms.length?ms.map(m=>`<p><b>${m.week}. Hafta:</b> ${e(m.home_name)} ${m.status==='played'?`<span class="score">${m.home_score}-${m.away_score}</span>`:' - '} ${e(m.away_name)}<br><span class="muted">${m.match_date?new Date(m.match_date).toLocaleString('tr-TR'):''} ${e(m.venue||'')}</span></p>`).join(''):'Henüz maç eklenmedi.'}</div>`))}catch(e){next(e)}});
+app.get('/istatistikler',async(req,res,next)=>{try{const s=await settings();const blocks=await Promise.all([['Gol Krallığı','goals'],['Asist Krallığı','assists'],['Kurtarış Liderleri','saves'],['Sarı Kart','yellow_cards'],['Kırmızı Kart','red_cards']].map(async([t,c])=>{const r=await leaders(c,50);return `<div class="card"><h2>${t}</h2>${r.length?r.map((x,i)=>`<p>${i+1}. ${e(x.name)} — ${e(x.team_name)} <b>${x.value}</b></p>`).join(''):'Henüz veri yok.'}</div>`}));res.send(layout(s,'İstatistikler',`<div class="grid">${blocks.join('')}</div>`))}catch(e){next(e)}});
+app.get('/takimlar',async(req,res,next)=>{try{const s=await settings(),ts=(await q(`SELECT t.*,COUNT(p.id)::int player_count FROM teams t LEFT JOIN players p ON p.team_id=t.id GROUP BY t.id ORDER BY t.name`)).rows;res.send(layout(s,'Takımlar',`<div class="grid">${ts.map(t=>`<div class="card"><h2>${e(t.name)}</h2><p>${t.player_count} oyuncu</p><a class="btn" href="/takim/${t.id}">Kadroyu Gör</a></div>`).join('')||'<div class="card">Henüz takım yok.</div>'}</div>`))}catch(e){next(e)}});
+app.get('/takim/:id',async(req,res,next)=>{try{const s=await settings(),t=(await q('SELECT * FROM teams WHERE id=$1',[req.params.id])).rows[0];if(!t)return res.status(404).send(layout(s,'Bulunamadı','<div class="card">Takım bulunamadı.</div>'));const ps=(await q('SELECT * FROM players WHERE team_id=$1 ORDER BY jersey_no NULLS LAST,name',[t.id])).rows;res.send(layout(s,t.name,`<div class="card"><h2>${e(t.name)}</h2>${ps.length?`<table><tr><th>No</th><th>Oyuncu</th><th>Pozisyon</th></tr>${ps.map(p=>`<tr><td>${p.jersey_no??'-'}</td><td>${e(p.name)}</td><td>${e(p.position)}</td></tr>`).join('')}</table>`:'Henüz oyuncu yok.'}</div>`))}catch(e){next(e)}});
 
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-app.set('trust proxy', 1);
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.urlencoded({ extended: true, limit: '1mb' }));
-app.use(express.json({ limit: '1mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
-app.use(session({
-  store: new pgSession({ pool, tableName: 'user_sessions', createTableIfMissing: true }),
-  name: 'adabuku.sid',
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly: true, secure: isProd, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 8 }
-}));
-
-const q = (text, params = []) => pool.query(text, params);
-const escInt = (v, fallback = 0) => Number.isFinite(Number(v)) ? Number(v) : fallback;
-const adminOnly = (req, res, next) => req.session.admin ? next() : res.redirect('/admin/login');
-
-async function initDb() {
-  await q(`CREATE TABLE IF NOT EXISTS settings (
-    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    league_name TEXT NOT NULL DEFAULT 'Adabükü Yazlıklar Ligi',
-    season TEXT NOT NULL DEFAULT '2026 Yaz Sezonu',
-    primary_color TEXT NOT NULL DEFAULT '#0b5d7a',
-    secondary_color TEXT NOT NULL DEFAULT '#f4b942',
-    logo_url TEXT DEFAULT '',
-    announcement TEXT DEFAULT 'Adabükü Yazlıklar Ligi resmi internet sitesine hoş geldiniz.'
-  )`);
-  await q(`INSERT INTO settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`);
-  await q(`CREATE TABLE IF NOT EXISTS teams (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    short_name TEXT NOT NULL DEFAULT '',
-    logo_url TEXT DEFAULT '',
-    color TEXT DEFAULT '#0b5d7a',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-  await q(`CREATE TABLE IF NOT EXISTS players (
-    id SERIAL PRIMARY KEY,
-    team_id INTEGER REFERENCES teams(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    jersey_no INTEGER,
-    position TEXT NOT NULL DEFAULT 'Oyuncu',
-    photo_url TEXT DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-  )`);
-  await q(`CREATE TABLE IF NOT EXISTS matches (
-    id SERIAL PRIMARY KEY,
-    week INTEGER NOT NULL DEFAULT 1,
-    match_date TIMESTAMPTZ,
-    venue TEXT DEFAULT '',
-    home_team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    away_team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
-    home_score INTEGER,
-    away_score INTEGER,
-    status TEXT NOT NULL DEFAULT 'scheduled' CHECK (status IN ('scheduled','played','postponed')),
-    notes TEXT DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CHECK (home_team_id <> away_team_id)
-  )`);
-  await q(`CREATE TABLE IF NOT EXISTS player_stats (
-    id SERIAL PRIMARY KEY,
-    match_id INTEGER REFERENCES matches(id) ON DELETE CASCADE,
-    player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
-    goals INTEGER NOT NULL DEFAULT 0,
-    assists INTEGER NOT NULL DEFAULT 0,
-    saves INTEGER NOT NULL DEFAULT 0,
-    yellow_cards INTEGER NOT NULL DEFAULT 0,
-    red_cards INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(match_id, player_id)
-  )`);
-}
-
-async function getSettings() {
-  const { rows } = await q('SELECT * FROM settings WHERE id=1');
-  return rows[0];
-}
-
-async function standings() {
-  const { rows } = await q(`
-    SELECT t.id, t.name, t.short_name, t.logo_url,
-      COUNT(m.id) FILTER (WHERE m.status='played')::int AS played,
-      COUNT(m.id) FILTER (WHERE m.status='played' AND ((m.home_team_id=t.id AND m.home_score>m.away_score) OR (m.away_team_id=t.id AND m.away_score>m.home_score)))::int AS won,
-      COUNT(m.id) FILTER (WHERE m.status='played' AND m.home_score=m.away_score)::int AS drawn,
-      COUNT(m.id) FILTER (WHERE m.status='played' AND ((m.home_team_id=t.id AND m.home_score<m.away_score) OR (m.away_team_id=t.id AND m.away_score<m.home_score)))::int AS lost,
-      COALESCE(SUM(CASE WHEN m.status='played' AND m.home_team_id=t.id THEN m.home_score WHEN m.status='played' AND m.away_team_id=t.id THEN m.away_score ELSE 0 END),0)::int AS gf,
-      COALESCE(SUM(CASE WHEN m.status='played' AND m.home_team_id=t.id THEN m.away_score WHEN m.status='played' AND m.away_team_id=t.id THEN m.home_score ELSE 0 END),0)::int AS ga,
-      (COUNT(m.id) FILTER (WHERE m.status='played' AND ((m.home_team_id=t.id AND m.home_score>m.away_score) OR (m.away_team_id=t.id AND m.away_score>m.home_score)))*3 +
-       COUNT(m.id) FILTER (WHERE m.status='played' AND m.home_score=m.away_score))::int AS points
-    FROM teams t
-    LEFT JOIN matches m ON (m.home_team_id=t.id OR m.away_team_id=t.id)
-    GROUP BY t.id
-    ORDER BY points DESC, (COALESCE(SUM(CASE WHEN m.status='played' AND m.home_team_id=t.id THEN m.home_score WHEN m.status='played' AND m.away_team_id=t.id THEN m.away_score ELSE 0 END),0)-COALESCE(SUM(CASE WHEN m.status='played' AND m.home_team_id=t.id THEN m.away_score WHEN m.status='played' AND m.away_team_id=t.id THEN m.home_score ELSE 0 END),0)) DESC, gf DESC, t.name
-  `);
-  return rows.map(r => ({ ...r, gd: r.gf - r.ga }));
-}
-
-async function leaders(column, limit = 10) {
-  const allowed = ['goals','assists','saves','yellow_cards','red_cards'];
-  if (!allowed.includes(column)) throw new Error('Geçersiz istatistik');
-  const { rows } = await q(`SELECT p.id, p.name, p.photo_url, p.position, t.name team_name, t.logo_url,
-    COALESCE(SUM(ps.${column}),0)::int value
-    FROM players p JOIN teams t ON t.id=p.team_id
-    LEFT JOIN player_stats ps ON ps.player_id=p.id
-    GROUP BY p.id,t.id HAVING COALESCE(SUM(ps.${column}),0)>0
-    ORDER BY value DESC,p.name LIMIT $1`, [limit]);
-  return rows;
-}
-
-app.use(async (req, res, next) => {
-  try {
-    res.locals.settings = await getSettings();
-    res.locals.isAdmin = Boolean(req.session.admin);
-    res.locals.path = req.path;
-    next();
-  } catch (e) { next(e); }
-});
-
-app.get('/', async (req, res, next) => {
-  try {
-    const [table, fixtures, results, goals, assists, saves] = await Promise.all([
-      standings(),
-      q(`SELECT m.*, h.name home_name,h.logo_url home_logo,a.name away_name,a.logo_url away_logo FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id WHERE m.status<>'played' ORDER BY m.match_date NULLS LAST,m.week LIMIT 8`).then(x=>x.rows),
-      q(`SELECT m.*, h.name home_name,h.logo_url home_logo,a.name away_name,a.logo_url away_logo FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id WHERE m.status='played' ORDER BY m.match_date DESC NULLS LAST,m.id DESC LIMIT 8`).then(x=>x.rows),
-      leaders('goals',5), leaders('assists',5), leaders('saves',5)
-    ]);
-    res.render('index', { title:'Ana Sayfa', table, fixtures, results, goals, assists, saves });
-  } catch(e){ next(e); }
-});
-
-app.get('/puan-durumu', async (req,res,next)=>{ try{ res.render('standings',{title:'Puan Durumu',table:await standings()}); }catch(e){next(e);} });
-app.get('/fikstur', async (req,res,next)=>{ try{ const {rows}=await q(`SELECT m.*,h.name home_name,h.logo_url home_logo,a.name away_name,a.logo_url away_logo FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id ORDER BY m.week,m.match_date NULLS LAST,m.id`); res.render('fixtures',{title:'Fikstür ve Sonuçlar',matches:rows}); }catch(e){next(e);} });
-app.get('/istatistikler', async (req,res,next)=>{ try{ res.render('stats',{title:'İstatistikler',goals:await leaders('goals',50),assists:await leaders('assists',50),saves:await leaders('saves',50),yellows:await leaders('yellow_cards',50),reds:await leaders('red_cards',50)}); }catch(e){next(e);} });
-app.get('/takimlar', async(req,res,next)=>{ try{ const {rows}=await q(`SELECT t.*,COUNT(p.id)::int player_count FROM teams t LEFT JOIN players p ON p.team_id=t.id GROUP BY t.id ORDER BY t.name`); res.render('teams',{title:'Takımlar',teams:rows}); }catch(e){next(e);} });
-app.get('/takim/:id', async(req,res,next)=>{ try{ const team=(await q('SELECT * FROM teams WHERE id=$1',[req.params.id])).rows[0]; if(!team)return res.status(404).render('error',{title:'Bulunamadı',message:'Takım bulunamadı.'}); const players=(await q(`SELECT p.*,COALESCE(SUM(ps.goals),0)::int goals,COALESCE(SUM(ps.assists),0)::int assists,COALESCE(SUM(ps.saves),0)::int saves FROM players p LEFT JOIN player_stats ps ON ps.player_id=p.id WHERE p.team_id=$1 GROUP BY p.id ORDER BY p.jersey_no NULLS LAST,p.name`,[team.id])).rows; res.render('team',{title:team.name,team,players}); }catch(e){next(e);} });
-
-app.get('/admin/login',(req,res)=>res.render('admin-login',{title:'Yönetici Girişi',error:null}));
-app.post('/admin/login', async(req,res)=>{
-  const user=String(req.body.username||''); const pass=String(req.body.password||'');
-  const validUser=user===String(process.env.ADMIN_USERNAME||'admin');
-  const envPass=String(process.env.ADMIN_PASSWORD||'');
-  const validPass=envPass.startsWith('$2') ? await bcrypt.compare(pass,envPass) : pass===envPass;
-  if(validUser&&validPass){req.session.admin=true;return res.redirect('/admin');}
-  res.status(401).render('admin-login',{title:'Yönetici Girişi',error:'Kullanıcı adı veya şifre hatalı.'});
-});
+app.get('/admin/login',async(req,res)=>{const s=await settings();res.send(layout(s,'Yönetici Girişi',`<div class="card" style="max-width:420px;margin:auto"><h2>Yönetici Girişi</h2><form method="post"><input name="username" placeholder="Kullanıcı adı" required><input type="password" name="password" placeholder="Şifre" required><button>Giriş Yap</button></form></div>`))});
+app.post('/admin/login',async(req,res)=>{if(String(req.body.username)===(process.env.ADMIN_USERNAME||'admin')&&String(req.body.password)===String(process.env.ADMIN_PASSWORD||'')){req.session.admin=true;return res.redirect('/admin')}const s=await settings();res.status(401).send(layout(s,'Giriş Hatası','<div class="card">Kullanıcı adı veya şifre hatalı. <a href="/admin/login">Tekrar dene</a></div>'))});
 app.post('/admin/logout',(req,res)=>req.session.destroy(()=>res.redirect('/')));
-
-app.get('/admin',adminOnly,async(req,res,next)=>{try{ const [teams,players,matches]=await Promise.all([q('SELECT COUNT(*)::int c FROM teams'),q('SELECT COUNT(*)::int c FROM players'),q('SELECT COUNT(*)::int c FROM matches')]);res.render('admin',{title:'Yönetim Paneli',counts:{teams:teams.rows[0].c,players:players.rows[0].c,matches:matches.rows[0].c}});}catch(e){next(e);}});
-app.get('/admin/settings',adminOnly,(req,res)=>res.render('admin-settings',{title:'Lig Ayarları'}));
-app.post('/admin/settings',adminOnly,async(req,res,next)=>{try{await q(`UPDATE settings SET league_name=$1,season=$2,primary_color=$3,secondary_color=$4,logo_url=$5,announcement=$6 WHERE id=1`,[req.body.league_name,req.body.season,req.body.primary_color,req.body.secondary_color,req.body.logo_url,req.body.announcement]);res.redirect('/admin/settings');}catch(e){next(e);}});
-
-app.get('/admin/teams',adminOnly,async(req,res,next)=>{try{res.render('admin-teams',{title:'Takımları Yönet',teams:(await q('SELECT * FROM teams ORDER BY name')).rows});}catch(e){next(e);}});
-app.post('/admin/teams',adminOnly,async(req,res,next)=>{try{await q('INSERT INTO teams(name,short_name,logo_url,color) VALUES($1,$2,$3,$4)',[req.body.name,req.body.short_name||'',req.body.logo_url||'',req.body.color||'#0b5d7a']);res.redirect('/admin/teams');}catch(e){next(e);}});
-app.post('/admin/teams/:id/delete',adminOnly,async(req,res,next)=>{try{await q('DELETE FROM teams WHERE id=$1',[req.params.id]);res.redirect('/admin/teams');}catch(e){next(e);}});
-
-app.get('/admin/players',adminOnly,async(req,res,next)=>{try{const [players,teams]=await Promise.all([q(`SELECT p.*,t.name team_name FROM players p JOIN teams t ON t.id=p.team_id ORDER BY t.name,p.name`),q('SELECT * FROM teams ORDER BY name')]);res.render('admin-players',{title:'Oyuncuları Yönet',players:players.rows,teams:teams.rows});}catch(e){next(e);}});
-app.post('/admin/players',adminOnly,async(req,res,next)=>{try{await q('INSERT INTO players(team_id,name,jersey_no,position,photo_url) VALUES($1,$2,$3,$4,$5)',[req.body.team_id,req.body.name,req.body.jersey_no||null,req.body.position||'Oyuncu',req.body.photo_url||'']);res.redirect('/admin/players');}catch(e){next(e);}});
-app.post('/admin/players/:id/delete',adminOnly,async(req,res,next)=>{try{await q('DELETE FROM players WHERE id=$1',[req.params.id]);res.redirect('/admin/players');}catch(e){next(e);}});
-
-app.get('/admin/matches',adminOnly,async(req,res,next)=>{try{const [matches,teams]=await Promise.all([q(`SELECT m.*,h.name home_name,a.name away_name FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id ORDER BY m.week,m.match_date NULLS LAST`),q('SELECT * FROM teams ORDER BY name')]);res.render('admin-matches',{title:'Fikstürü Yönet',matches:matches.rows,teams:teams.rows});}catch(e){next(e);}});
-app.post('/admin/matches',adminOnly,async(req,res,next)=>{try{await q(`INSERT INTO matches(week,match_date,venue,home_team_id,away_team_id,status,notes) VALUES($1,$2,$3,$4,$5,$6,$7)`,[escInt(req.body.week,1),req.body.match_date||null,req.body.venue||'',req.body.home_team_id,req.body.away_team_id,req.body.status||'scheduled',req.body.notes||'']);res.redirect('/admin/matches');}catch(e){next(e);}});
-app.post('/admin/matches/:id/result',adminOnly,async(req,res,next)=>{try{await q(`UPDATE matches SET home_score=$1,away_score=$2,status='played' WHERE id=$3`,[escInt(req.body.home_score),escInt(req.body.away_score),req.params.id]);res.redirect('/admin/matches');}catch(e){next(e);}});
-app.post('/admin/matches/:id/delete',adminOnly,async(req,res,next)=>{try{await q('DELETE FROM matches WHERE id=$1',[req.params.id]);res.redirect('/admin/matches');}catch(e){next(e);}});
-
-app.get('/admin/stats',adminOnly,async(req,res,next)=>{try{const [players,matches,stats]=await Promise.all([q(`SELECT p.id,p.name,t.name team_name FROM players p JOIN teams t ON t.id=p.team_id ORDER BY t.name,p.name`),q(`SELECT m.id,m.week,h.name home_name,a.name away_name FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id ORDER BY m.id DESC`),q(`SELECT ps.*,p.name player_name,h.name home_name,a.name away_name FROM player_stats ps JOIN players p ON p.id=ps.player_id LEFT JOIN matches m ON m.id=ps.match_id LEFT JOIN teams h ON h.id=m.home_team_id LEFT JOIN teams a ON a.id=m.away_team_id ORDER BY ps.id DESC LIMIT 100`)]);res.render('admin-stats',{title:'Oyuncu İstatistikleri',players:players.rows,matches:matches.rows,stats:stats.rows});}catch(e){next(e);}});
-app.post('/admin/stats',adminOnly,async(req,res,next)=>{try{await q(`INSERT INTO player_stats(match_id,player_id,goals,assists,saves,yellow_cards,red_cards) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(match_id,player_id) DO UPDATE SET goals=EXCLUDED.goals,assists=EXCLUDED.assists,saves=EXCLUDED.saves,yellow_cards=EXCLUDED.yellow_cards,red_cards=EXCLUDED.red_cards`,[req.body.match_id||null,req.body.player_id,escInt(req.body.goals),escInt(req.body.assists),escInt(req.body.saves),escInt(req.body.yellow_cards),escInt(req.body.red_cards)]);res.redirect('/admin/stats');}catch(e){next(e);}});
-
-app.get('/health',(req,res)=>res.json({ok:true,time:new Date().toISOString()}));
-app.use((req,res)=>res.status(404).render('error',{title:'Sayfa Bulunamadı',message:'Aradığınız sayfa bulunamadı.'}));
-app.use((err,req,res,next)=>{console.error(err);res.status(500).render('error',{title:'Bir hata oluştu',message:isProd?'İşlem sırasında bir hata oluştu. Lütfen tekrar deneyin.':err.message});});
-
-initDb().then(()=>app.listen(PORT,'0.0.0.0',()=>console.log(`Adabuku Ligi http://localhost:${PORT}`))).catch(err=>{console.error('Veritabani baslatma hatasi:',err);process.exit(1);});
+app.get('/admin',adminOnly,async(req,res,next)=>{try{const s=await settings(),a=await Promise.all(['teams','players','matches'].map(x=>q(`SELECT COUNT(*)::int c FROM ${x}`)));res.send(layout(s,'Yönetim Paneli',`<div class="grid"><div class="card"><h2>${a[0].rows[0].c}</h2>Takım</div><div class="card"><h2>${a[1].rows[0].c}</h2>Oyuncu</div><div class="card"><h2>${a[2].rows[0].c}</h2>Maç</div></div>`,true))}catch(e){next(e)}});
+app.get('/admin/settings',adminOnly,async(req,res)=>{const s=await settings();res.send(layout(s,'Lig Ayarları',`<div class="card"><h2>Lig Ayarları</h2><form method="post"><label>Lig adı</label><input name="league_name" value="${e(s.league_name)}"><label>Sezon</label><input name="season" value="${e(s.season)}"><div class="row"><div><label>Ana renk</label><input type="color" name="primary_color" value="${e(s.primary_color)}"></div><div><label>İkinci renk</label><input type="color" name="secondary_color" value="${e(s.secondary_color)}"></div></div><label>Logo URL</label><input name="logo_url" value="${e(s.logo_url)}"><label>Duyuru</label><textarea name="announcement">${e(s.announcement)}</textarea><button>Kaydet</button></form></div>`,true))});
+app.post('/admin/settings',adminOnly,async(req,res,next)=>{try{await q('UPDATE settings SET league_name=$1,season=$2,primary_color=$3,secondary_color=$4,logo_url=$5,announcement=$6 WHERE id=1',[req.body.league_name,req.body.season,req.body.primary_color,req.body.secondary_color,req.body.logo_url,req.body.announcement]);res.redirect('/admin/settings')}catch(e){next(e)}});
+app.get('/admin/teams',adminOnly,async(req,res)=>{const s=await settings(),ts=(await q('SELECT * FROM teams ORDER BY name')).rows;res.send(layout(s,'Takımlar',`<div class="card"><h2>Takım Ekle</h2><form method="post"><div class="row"><input name="name" placeholder="Takım adı" required><input name="short_name" placeholder="Kısa ad"><input name="logo_url" placeholder="Logo URL"><input type="color" name="color" value="#075985"></div><button>Ekle</button></form></div><div class="card"><table>${ts.map(t=>`<tr><td>${e(t.name)}</td><td><form method="post" action="/admin/teams/${t.id}/delete"><button class="danger">Sil</button></form></td></tr>`).join('')}</table></div>`,true))});
+app.post('/admin/teams',adminOnly,async(req,res,next)=>{try{await q('INSERT INTO teams(name,short_name,logo_url,color) VALUES($1,$2,$3,$4)',[req.body.name,req.body.short_name||'',req.body.logo_url||'',req.body.color||'#075985']);res.redirect('/admin/teams')}catch(e){next(e)}});
+app.post('/admin/teams/:id/delete',adminOnly,async(req,res,next)=>{try{await q('DELETE FROM teams WHERE id=$1',[req.params.id]);res.redirect('/admin/teams')}catch(e){next(e)}});
+app.get('/admin/players',adminOnly,async(req,res)=>{const s=await settings(),ts=(await q('SELECT * FROM teams ORDER BY name')).rows,ps=(await q(`SELECT p.*,t.name team_name FROM players p JOIN teams t ON t.id=p.team_id ORDER BY t.name,p.name`)).rows;res.send(layout(s,'Oyuncular',`<div class="card"><h2>Oyuncu Ekle</h2><form method="post"><div class="row"><select name="team_id" required><option value="">Takım seç</option>${ts.map(t=>`<option value="${t.id}">${e(t.name)}</option>`).join('')}</select><input name="name" placeholder="Ad soyad" required><input type="number" name="jersey_no" placeholder="Forma no"><select name="position"><option>Oyuncu</option><option>Kaleci</option><option>Defans</option><option>Orta Saha</option><option>Forvet</option></select></div><button>Ekle</button></form></div><div class="card"><table>${ps.map(p=>`<tr><td>${e(p.team_name)}</td><td>${e(p.name)}</td><td>${e(p.position)}</td><td><form method="post" action="/admin/players/${p.id}/delete"><button class="danger">Sil</button></form></td></tr>`).join('')}</table></div>`,true))});
+app.post('/admin/players',adminOnly,async(req,res,next)=>{try{await q('INSERT INTO players(team_id,name,jersey_no,position) VALUES($1,$2,$3,$4)',[req.body.team_id,req.body.name,req.body.jersey_no||null,req.body.position||'Oyuncu']);res.redirect('/admin/players')}catch(e){next(e)}});
+app.post('/admin/players/:id/delete',adminOnly,async(req,res,next)=>{try{await q('DELETE FROM players WHERE id=$1',[req.params.id]);res.redirect('/admin/players')}catch(e){next(e)}});
+app.get('/admin/matches',adminOnly,async(req,res)=>{const s=await settings(),ts=(await q('SELECT * FROM teams ORDER BY name')).rows,ms=(await q(`SELECT m.*,h.name home_name,a.name away_name FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id ORDER BY m.week,m.id`)).rows;const opts=ts.map(t=>`<option value="${t.id}">${e(t.name)}</option>`).join('');res.send(layout(s,'Maçlar',`<div class="card"><h2>Maç Ekle</h2><form method="post"><div class="row"><input type="number" name="week" value="1" min="1"><select name="home_team_id" required><option value="">Ev sahibi</option>${opts}</select><select name="away_team_id" required><option value="">Deplasman</option>${opts}</select><input type="datetime-local" name="match_date"><input name="venue" placeholder="Saha"></div><button>Ekle</button></form></div><div class="card">${ms.map(m=>`<div style="border-bottom:1px solid #ddd;padding:12px 0"><b>${m.week}. Hafta — ${e(m.home_name)} ${m.status==='played'?`${m.home_score}-${m.away_score}`:'-'} ${e(m.away_name)}</b><form method="post" action="/admin/matches/${m.id}/result" class="row"><input type="number" name="home_score" min="0" placeholder="Ev"><input type="number" name="away_score" min="0" placeholder="Dep"><button>Sonucu Kaydet</button></form><form method="post" action="/admin/matches/${m.id}/delete"><button class="danger">Maçı Sil</button></form></div>`).join('')||'Henüz maç yok.'}</div>`,true))});
+app.post('/admin/matches',adminOnly,async(req,res,next)=>{try{await q(`INSERT INTO matches(week,match_date,venue,home_team_id,away_team_id,status) VALUES($1,$2,$3,$4,$5,'scheduled')`,[n(req.body.week,1),req.body.match_date||null,req.body.venue||'',req.body.home_team_id,req.body.away_team_id]);res.redirect('/admin/matches')}catch(e){next(e)}});
+app.post('/admin/matches/:id/result',adminOnly,async(req,res,next)=>{try{await q(`UPDATE matches SET home_score=$1,away_score=$2,status='played' WHERE id=$3`,[n(req.body.home_score),n(req.body.away_score),req.params.id]);res.redirect('/admin/matches')}catch(e){next(e)}});
+app.post('/admin/matches/:id/delete',adminOnly,async(req,res,next)=>{try{await q('DELETE FROM matches WHERE id=$1',[req.params.id]);res.redirect('/admin/matches')}catch(e){next(e)}});
+app.get('/admin/stats',adminOnly,async(req,res)=>{const s=await settings(),ps=(await q(`SELECT p.id,p.name,t.name team_name FROM players p JOIN teams t ON t.id=p.team_id ORDER BY t.name,p.name`)).rows,ms=(await q(`SELECT m.id,m.week,h.name home_name,a.name away_name FROM matches m JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id ORDER BY m.id DESC`)).rows;res.send(layout(s,'İstatistik Girişi',`<div class="card"><h2>Oyuncu İstatistiği Gir</h2><form method="post"><select name="match_id" required><option value="">Maç seç</option>${ms.map(m=>`<option value="${m.id}">${m.week}. hafta: ${e(m.home_name)} - ${e(m.away_name)}</option>`).join('')}</select><select name="player_id" required><option value="">Oyuncu seç</option>${ps.map(p=>`<option value="${p.id}">${e(p.team_name)} — ${e(p.name)}</option>`).join('')}</select><div class="row"><input type="number" min="0" name="goals" value="0" placeholder="Gol"><input type="number" min="0" name="assists" value="0" placeholder="Asist"><input type="number" min="0" name="saves" value="0" placeholder="Kurtarış"><input type="number" min="0" name="yellow_cards" value="0" placeholder="Sarı"><input type="number" min="0" name="red_cards" value="0" placeholder="Kırmızı"></div><button>Kaydet</button></form></div>`,true))});
+app.post('/admin/stats',adminOnly,async(req,res,next)=>{try{await q(`INSERT INTO player_stats(match_id,player_id,goals,assists,saves,yellow_cards,red_cards) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(match_id,player_id) DO UPDATE SET goals=EXCLUDED.goals,assists=EXCLUDED.assists,saves=EXCLUDED.saves,yellow_cards=EXCLUDED.yellow_cards,red_cards=EXCLUDED.red_cards`,[req.body.match_id,req.body.player_id,n(req.body.goals),n(req.body.assists),n(req.body.saves),n(req.body.yellow_cards),n(req.body.red_cards)]);res.redirect('/admin/stats')}catch(e){next(e)}});
+app.get('/health',(req,res)=>res.json({ok:true}));
+app.use(async(req,res)=>{const s=await settings();res.status(404).send(layout(s,'Bulunamadı','<div class="card">Sayfa bulunamadı.</div>'))});
+app.use(async(err,req,res,next)=>{console.error(err);const s=await settings().catch(()=>({league_name:'Adabükü Ligi',season:'',primary_color:'#075985',secondary_color:'#f59e0b'}));res.status(500).send(layout(s,'Hata',`<div class="card"><h2>Bir hata oluştu</h2><p>${isProd?'Lütfen tekrar deneyin.':e(err.message)}</p></div>`))});
+initDb().then(()=>app.listen(PORT,'0.0.0.0',()=>console.log(`Adabuku Ligi http://localhost:${PORT}`))).catch(err=>{console.error(err);process.exit(1)});
